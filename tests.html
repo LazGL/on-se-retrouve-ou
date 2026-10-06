@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tests trajet</title>
+<style>
+  :root { --bg:#fafaf9; --ink:#1c1917; --ok:#15803d; --ko:#dc2626; --mute:#78716c; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#1c1917; --ink:#f5f5f4; --ok:#4ade80; --ko:#f87171; --mute:#a8a29e; } }
+  body { margin:0; padding:20px 16px; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui, sans-serif; }
+  #summary { font-weight:700; font-size:16px; margin-bottom:10px; }
+  .ok { color:var(--ok); } .ko { color:var(--ko); } .err { color:var(--mute); font-size:12px; margin-left:18px; }
+</style>
+</head>
+<body>
+<div id="summary">Tests en cours…</div>
+<div id="list"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/suncalc@1.9.0/suncalc.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/opening_hours@3.15.0/build/opening_hours.min.js"></script>
+<script src="js/config.js?v=41"></script>
+<script src="js/geo.js?v=41"></script>
+<script src="js/ranking.js?v=41"></script>
+<script src="js/share.js?v=41"></script>
+<script src="js/hours.js?v=41"></script>
+<script src="js/weather.js?v=41"></script>
+<script>
+const results = [];
+function test(name, fn) {
+  try { fn(); results.push({ name, ok: true }); } catch (e) { results.push({ name, ok: false, err: e.message }); }
+}
+function eq(a, b, msg = '') {
+  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${msg} attendu ${JSON.stringify(b)}, obtenu ${JSON.stringify(a)}`);
+}
+function near(a, b, tol, msg = '') {
+  if (!(Math.abs(a - b) <= tol)) throw new Error(`${msg} attendu ${b} ± ${tol}, obtenu ${a}`);
+}
+function ok(c, msg = 'condition fausse') { if (!c) throw new Error(msg); }
+
+const PARIS = { lat: 48.8566, lon: 2.3522 };
+// Point à `m` mètres au nord de PARIS
+const north = m => ({ lat: PARIS.lat + m / 111320, lon: PARIS.lon });
+
+// ---------- geo.js ----------
+test('dist : 1 km au nord ≈ 1000 m', () => near(dist(PARIS, north(1000)), 1000, 2));
+
+test('decodePolyline : exemple de la doc Google (précision 5)', () => {
+  const pts = decodePolyline('_p~iF~ps|U_ulLnnqC_mqNvxq`@', 5);
+  eq(pts.map(([a, b]) => [+a.toFixed(3), +b.toFixed(3)]), [[38.5, -120.2], [40.7, -120.95], [43.252, -126.453]]);
+});
+
+test('decodePolyline : précision 7 sans débordement (longitude 179°)', () => {
+  // encode à la main lat 1, lon 179 en précision 7
+  const enc = v => { let n = Math.round(v * 1e7); n = n < 0 ? -2 * n - 1 : 2 * n; let s = ''; while (n >= 32) { s += String.fromCharCode((n % 32 + 32) + 63); n = Math.floor(n / 32); } return s + String.fromCharCode(n + 63); };
+  const [[lat, lon]] = decodePolyline(enc(1) + enc(179), 7);
+  near(lat, 1, 1e-7); near(lon, 179, 1e-7);
+});
+
+test('makeGrid : 7×7 points, le point du milieu est le centre', () => {
+  const g = makeGrid(PARIS, 1000, 7);
+  eq(g.points.length, 49);
+  const mid = g.points[24];
+  near(mid.lat, PARIS.lat, 1e-9); near(mid.lon, PARIS.lon, 1e-9);
+  near(dist(g.points[0], g.points[6]), 2000, 5, 'largeur');
+  near(g.stepM, 2000 / 6, 1e-6);
+});
+
+test('interpolate : valeur linéaire retrouvée entre deux points', () => {
+  const g = makeGrid(PARIS, 1000, 3);
+  const values = g.points.map((_, k) => Math.floor(k / 3) * 100); // 0 au sud, 200 au nord
+  near(interpolate(g, values, PARIS), 100, 1e-6, 'centre');
+  near(interpolate(g, values, north(500)), 150, 1, 'mi-chemin nord');
+  near(interpolate(g, values, north(5000)), 200, 1e-6, 'hors grille : bord');
+});
+
+test('interpolate : ignore les coins sans valeur', () => {
+  const g = makeGrid(PARIS, 1000, 3);
+  const values = [Infinity, 100, 100, 100, 100, 100, 100, 100, 100];
+  near(interpolate(g, values, g.points[0]), 100, 1e-6, 'coin inconnu : voisins');
+  eq(interpolate(g, Array(9).fill(Infinity), PARIS), Infinity);
+});
+
+test('bbox / boxHalf / growBox', () => {
+  const b = bbox([PARIS, north(1000)], 100);
+  near(boxHalf(b), 600, 5);
+  near(boxHalf(growBox(b, 2)), 1200, 10);
+  near(boxHalf(boxAround(PARIS, 1500)), 1500, 5);
+});
+
+// ---------- ranking.js ----------
+test('modesFor : seuils du mode Auto', () => {
+  eq(modesFor({ ...north(500), mode: 'auto' }, PARIS), ['walk', 'bike'], '500 m');
+  eq(modesFor({ ...north(2000), mode: 'auto' }, PARIS), ['walk', 'bike', 'transit'], '2 km');
+  eq(modesFor({ ...north(5000), mode: 'auto' }, PARIS), ['bike', 'transit'], '5 km');
+  eq(modesFor({ ...north(5000), mode: 'nobike' }, PARIS), ['transit'], 'sans vélo 5 km');
+  eq(modesFor({ ...north(500), mode: 'nobike' }, PARIS), ['walk'], 'sans vélo 500 m');
+  eq(modesFor({ ...north(5000), mode: 'transit' }, PARIS), ['transit', 'walk'], 'transports');
+  eq(modesFor({ ...north(5000), mode: 'walk' }, PARIS), ['walk'], 'marche');
+  eq(modesFor({ ...north(2000), mode: 'autovelib' }, PARIS), ['walk', 'velib', 'transit'], 'Auto avec Vélib 2 km');
+  eq(modesFor({ ...north(5000), mode: 'autovelib' }, PARIS), ['velib', 'transit'], 'Auto avec Vélib 5 km');
+  eq(modesFor({ ...north(5000), mode: 'velib' }, PARIS), ['velib', 'walk'], 'Vélib seul');
+  ok(isAuto('autovelib') && isAuto('nobike') && !isAuto('velib'), 'isAuto');
+});
+
+test('Vélib : station la plus proche utilisable, et temps total', () => {
+  const st = (m, bikes, docks, extra = {}) => ({ name: `S${m}`, ...north(m), bikes, docks, renting: true, returning: true, ...extra });
+  const stations = [st(100, 1, 20), st(200, 5, 0), st(300, 8, 10), st(350, 9, 9, { renting: false }), st(900, 20, 20)];
+  eq(nearestStation(stations, PARIS, canRent).name, 'S200', 'départ : 1 seul vélo à 100 m, on prend 200 m');
+  eq(nearestStation(stations, PARIS, canReturn).name, 'S100', 'arrivée : places à 100 m');
+  eq(nearestStation(stations, north(-2000), canRent), null, 'rien à moins de 600 m');
+  const parts = velibParts(PARIS, stations[1], stations[4], north(1000), 240);
+  near(parts.walkIn, 200, 1); near(parts.walkOut, 100, 1);
+  near(parts.sec, 200 + VELIB_OVERHEAD + 240 + 100, 2);
+  eq(velibParts(PARIS, stations[1], stations[1], north(250), 60), null, 'même station : pas de Vélib');
+});
+
+test('combine : garde les étapes Vélib', () => {
+  const legs = combine(1, 1, { walk: [[900]], velib: [[{ sec: 600, start: { name: 'A' } }]] });
+  eq([legs[0][0].via, legs[0][0].sec, legs[0][0].opts.velib.start.name], ['velib', 600, 'A']);
+});
+
+test('combine : garde le mode le plus rapide, ignore les trous', () => {
+  const legs = combine(2, 2, {
+    walk: [[600, 900]],
+    bike: [undefined, [300, null]],
+    transit: [[500, null], [400, 200]],
+  });
+  eq([legs[0][0].via, legs[0][0].sec], ['transit', 500]);
+  eq([legs[1][0].via, legs[1][0].sec], ['walk', 900]);
+  eq([legs[0][1].via, legs[0][1].sec], ['bike', 300]);
+  eq([legs[1][1].via, legs[1][1].sec], ['transit', 200]);
+  eq(Object.keys(legs[0][1].opts), ['bike', 'transit']);
+});
+
+test('pluie probable : le vélo compte plus en mode Auto, le temps affiché ne change pas', () => {
+  const times = { bike: [[600]], velib: [[{ sec: 700, bike: 400 }]], transit: [[800]] };
+  const [[dry]] = combine(1, 1, times);
+  eq([dry.via, dry.rain], ['bike', undefined], 'sec : vélo');
+  const [[wet]] = combine(1, 1, times, () => true);
+  eq([wet.via, wet.sec, wet.opts.bike.rain, wet.opts.velib.rain, wet.opts.transit.rain], ['transit', 800, 300, 200, undefined], 'pluie : transports');
+  const [[close]] = combine(1, 1, { bike: [[600]], transit: [[1000]] }, () => true);
+  eq([close.via, close.sec, close.rain, perceived(close)], ['bike', 600, 300, 900], 'vélo encore gagnant');
+  const trip = tripOf({}, close, null);
+  eq([trip.rain, trip.cost], [300, 900], 'compté pour l\'équité');
+  eq(combine(2, 1, { bike: [[600], [600]] }, pi => pi === 1)[0].map(l => l.rain), [undefined, 300], 'par personne');
+});
+
+test('en fauteuil : ni vélo ni Vélib\', itinéraires accessibles seulement', () => {
+  const far = { ...north(5000), wheelchair: true };
+  eq(modesFor({ ...far, mode: 'autovelib' }, PARIS), ['transit', 'walk'], 'Auto, même loin : transports et trottoir');
+  eq(modesFor({ ...far, mode: 'bike' }, PARIS), ['transit', 'walk'], 'vélo perso ignoré');
+  eq(modesFor({ ...far, mode: 'walk' }, PARIS), ['walk'], 'marche (trottoir) choisie');
+  const leg = a => ({ mode: 'BUS', wheelchairAccessible: a });
+  ok(accessibleItin({ legs: [{ mode: 'WALK' }, leg('ACCESSIBLE'), leg(undefined)] }), 'accessible ou non renseigné');
+  ok(!accessibleItin({ legs: [{ mode: 'WALK' }, leg('ACCESSIBLE'), { mode: 'SUBWAY', wheelchairAccessible: 'NOT_ACCESSIBLE' }] }), 'un trajet non accessible');
+  const place = wheelchair => ({ tags: { wheelchair } });
+  ok(enoughAccessible([1, 2, 3, 4, 5].map(() => place('yes'))) && !enoughAccessible([place('yes'), place('limited')], 2), 'assez de lieux accessibles');
+  const f = { noInaccessible: true, cuisines: new Set() };
+  eq([passesFilters(place('no'), f), passesFilters(place(undefined), f), passesFilters(place('limited'), f)], [false, true, true], 'non accessible écarté');
+});
+
+test('usefulModes : écarte un mode qui ne gagne nulle part dans la zone', () => {
+  // 1 personne, 3 points ; la marche n'est jamais à moins de 5 min du plus rapide, les transports si (point 1)
+  const legs = combine(1, 3, { walk: [[3000, 3100, 3200]], bike: [[600, 700, 800]], transit: [[1500, 900, 2000]] });
+  const p = { i: 0, modes: ['walk', 'bike', 'transit'] };
+  eq(usefulModes(p, legs, [true, true, true]), ['bike', 'transit']);
+  eq(usefulModes(p, legs, [true, false, true]), ['bike'], 'point 1 hors zone');
+  eq(usefulModes({ i: 0, modes: ['walk'] }, combine(1, 1, {}), [true]), ['walk'], 'rien de calculé : on garde tout');
+  eq(usefulModes(p, legs, [true, false, true], m => m === 'transit' ? 1000 : 300), ['bike', 'transit'], 'marge plus large pour les transports');
+});
+
+test('tripOf : retour compté, vélo perso aller-retour, trajet max', () => {
+  const [[leg]] = combine(1, 1, { walk: [[1500]], bike: [[500]], transit: [[700]] });
+  const [[back]] = combine(1, 1, { walk: [[900]], bike: [[1400]], transit: [[800]] });
+  const p = { i: 0, maxMin: null };
+  eq(tripOf(p, leg, null), { via: 'bike', sec: 500, transfers: 0, rain: 0, back: null, total: 500, cost: 500, over: false, slack: 0 }, 'sans retour');
+  // vélo perso : 500 + 1400 = 1900 ; sans vélo : transports 700 + retour transports 800 = 1500
+  const t = tripOf(p, leg, back);
+  eq([t.via, t.sec, t.back.via, t.back.sec, t.total], ['transit', 700, 'transit', 800, 1500]);
+  const [[back2]] = combine(1, 1, { walk: [[3000]], bike: [[450]], transit: [[2000]] });
+  const t2 = tripOf(p, leg, back2);
+  eq([t2.via, t2.back.via, t2.total], ['bike', 'bike', 950], 'vélo perso à l\'aller et au retour');
+  eq(tripOf({ i: 0, maxMin: 10 }, leg, back).over, true, 'transports 700 s > 10 min');
+  eq(tripOf({ i: 0, maxMin: 12 }, leg, back).over, false);
+  eq(scoreOf([{ over: true, sec: 100 }, { sec: 300, total: 900 }]).max, Infinity);
+  eq(scoreOf([{ sec: 300, total: 900 }, { sec: 600 }]).max, 900, 'le retour compte');
+});
+
+test('personne flexible : ses minutes acceptées comptent moins pour l\'équité', () => {
+  // A : 20 min, B : 25 min mais accepte +10 → B compte 15 : c'est A le plus long
+  const [[a]] = combine(1, 1, { transit: [[1200]] }), [[b]] = combine(1, 1, { transit: [[1500]] });
+  const la = tripOf({ i: 0 }, a, null), lb = tripOf({ i: 1, slack: 10 }, b, null);
+  eq([lb.slack, lb.total, costOf(lb)], [600, 1500, 900]);
+  eq(scoreOf([la, lb]).max, 1200);
+  eq(scoreOf([la, tripOf({ i: 1 }, b, null)]).max, 1500, 'sans flexibilité');
+  eq(costOf({ ...lb, over: true }), Infinity, 'trajet max : toujours exclu');
+});
+
+test('backDate : heure de retour', () => {
+  const arrive = new Date(2026, 8, 25, 19, 0);
+  eq(hhmm(backDate(arrive, '', 'bar')), '21:00', 'par défaut : 2 h au bar');
+  eq(hhmm(backDate(arrive, '', 'resto')), '20:15', 'par défaut : 1 h 15 au resto');
+  const late = backDate(arrive, '00:30', 'bar');
+  eq([hhmm(late), late.getDate()], ['00:30', 26], 'après minuit : le lendemain');
+});
+
+test('correspondances : 5 min de pénalité pour choisir et classer', () => {
+  // transports 20 min avec 2 correspondances (ressenti 30) contre Vélib 25 min : Vélib
+  const [[l]] = combine(1, 1, { velib: [[{ sec: 1500 }]], transit: [[{ sec: 1200, transfers: 2 }]] });
+  eq([l.via, l.sec, perceived(l.opts.transit)], ['velib', 1500, 1200 + 2 * TRANSFER_PENALTY]);
+  // direct 22 min contre 1 correspondance 20 min : direct
+  const [[l2]] = combine(1, 1, { walk: [[1320]], transit: [[{ sec: 1200, transfers: 1 }]] });
+  eq(l2.via, 'walk');
+  const t = tripOf({ i: 0 }, l, null);
+  eq([t.total, t.cost], [1500, 1500]);
+  const [[back]] = combine(1, 1, { transit: [[{ sec: 900, transfers: 1 }]] });
+  const t2 = tripOf({ i: 0 }, l, back);
+  eq([t2.total, t2.cost, t2.back.transfers], [2400, 2400 + TRANSFER_PENALTY, 1], 'retour avec correspondance');
+});
+
+test('Vélib : au moins 4 places à l\'arrivée', () => {
+  const s = (docks) => ({ ...north(50), bikes: 10, docks, renting: true, returning: true });
+  eq([canReturn(s(3)), canReturn(s(4)), canRent({ ...s(0), bikes: 1 })], [false, true, false]);
+});
+
+test('neededMax : trajet max à prévoir quand aucun point ne le respecte', () => {
+  const people = [{ i: 0, name: 'Alice', maxMin: 10 }, { i: 1, name: 'Zoé', maxMin: 10 }, { i: 2, name: 'Bob' }];
+  const pt = (a, b, c) => [a, b, c].map((sec, i) => tripOf(people[i], { via: 'transit', sec, opts: {} }, null));
+  const legs = [pt(700, 1900, 600), pt(1300, 1310, 900), pt(2000, 500, 700)];
+  ok(legs.every(ls => !isFinite(scoreOf(ls).max)), 'aucun point possible');
+  eq(neededMax(legs, people).map(({ p, min }) => [p.name, min]), [['Alice', 25], ['Zoé', 25]], 'point du milieu, arrondi aux 5 min');
+  eq(neededMax([pt(null, 600, 600)], people), [], 'personne sans trajet : rien à proposer');
+});
+
+test('scoreOf / fairZone', () => {
+  const s = scoreOf([{ sec: 600 }, { sec: 900 }, { sec: null }]);
+  eq([s.max, s.min], [Infinity, 600]);
+  const z = fairZone([600, 700, 900, 1000, Infinity], 300);
+  eq([z.best, z.limit, z.mask], [600, 900, [true, true, true, false, false]]);
+});
+
+test('pickDiverse : écart minimal puis complément', () => {
+  const pts = Array.from({ length: 10 }, (_, k) => ({ ...north(k * 50), tags: {} }));
+  const picked = pickDiverse(pts, 3, { minGap: 120 });
+  eq(picked.map(p => pts.indexOf(p)), [0, 3, 6]);
+  eq(pickDiverse(pts, 5, { minGap: 1000 }).length, 5, 'complète si trop contraint');
+});
+
+test('pickDiverse : plafond par cuisine', () => {
+  const pts = ['french', 'french', 'french', 'italian'].map((c, k) => ({ ...north(k * 500), tags: { cuisine: c } }));
+  eq(pickDiverse(pts, 3, { maxSame: 2 }).map(p => p.tags.cuisine), ['french', 'french', 'italian']);
+});
+
+test('passesFilters', () => {
+  const base = { tags: { cuisine: 'italian;pizza', outdoor_seating: 'yes' }, hours: { status: 'open' } };
+  const f = { openOnly: true, terrace: false, veggie: false, cuisines: new Set() };
+  ok(passesFilters(base, f), 'sans filtre');
+  ok(!passesFilters({ ...base, hours: { status: 'closed' } }, f), 'fermé');
+  ok(passesFilters({ ...base, hours: { status: 'unknown' } }, f), 'horaires inconnus gardés');
+  ok(passesFilters(base, { ...f, terrace: true }), 'terrasse');
+  ok(!passesFilters(base, { ...f, veggie: true }), 'pas végé');
+  ok(passesFilters(base, { ...f, cuisines: new Set(['pizza']) }), 'cuisine secondaire');
+  ok(!passesFilters(base, { ...f, cuisines: new Set(['japanese']) }), 'autre cuisine');
+  eq(cuisinesOf({ cuisine: 'yes' }), [], 'cuisine=yes ignoré');
+  ok(!passesFilters(base, { ...f, wheelchair: true }), 'accessibilité non renseignée');
+  ok(passesFilters({ ...base, tags: { ...base.tags, wheelchair: 'yes' } }, { ...f, wheelchair: true }), 'accessible');
+  ok(!passesFilters({ ...base, tags: { ...base.tags, wheelchair: 'limited' } }, { ...f, wheelchair: true }), 'accès limité : écarté');
+  eq(cuisinesOf({ cuisine: 'Italian; pizza' }), ['italian', 'pizza']);
+});
+
+test('dedupeByName : même nom tout près = doublon', () => {
+  const pl = (name, m) => ({ name, ...north(m), tags: {} });
+  const list = [pl('Bastille', 0), pl('bastille ', 150), pl('Bastille', 900), pl('Chez Paul', 100)];
+  eq(dedupeByName(list).map(p => list.indexOf(p)), [0, 2, 3]);
+});
+
+test('parcs : taille dans le départage, squares minuscules écartés', () => {
+  const park = (area, name = 'P') => ({ name, ...PARIS, area, tags: { leisure: 'park' } });
+  eq([quality(park(800)), quality(park(5000)), quality(park(20000)), quality(park(80000)), quality(park(null))], [-1, 0, 1, 2, 0]);
+  eq(quality({ area: 800, tags: { amenity: 'restaurant' } }), 0, 'la taille ne compte que pour les parcs');
+  const list = [park(500), park(9000), park(null), park(30000)];
+  eq(dropTinyParks(list, 3).length, 3);
+  eq(dropTinyParks(list, 4).length, 4, 'pas assez de grands : on garde tout');
+  near(boxArea(bbox([PARIS, north(100)], 0)) , 0, 1e-6, 'rectangle plat');
+  near(boxArea(boxAround(PARIS, 50)), 10000, 50, '100 m × 100 m');
+});
+
+test('compareRanked : minute, puis qualité, puis somme', () => {
+  const r = (max, q, sum) => ({ score: { max, sum }, q });
+  const list = [r(900, 0, 1500), r(890, 2, 1600), r(1200, 3, 1300), r(Infinity, 3, 0)];
+  eq(list.sort(compareRanked).map(x => x.score.max), [890, 900, 1200, Infinity]);
+});
+
+// ---------- share.js ----------
+test('lien de partage : aller-retour', () => {
+  const state = { kind: 'bar', when: '2026-09-25T19:00', people: [
+    { name: 'Alice', q: 'Place de la République, Paris', mode: 'auto', lat: 48.875123456, lon: 2.33 },
+    { name: '', q: 'Place de la Bastille', mode: 'nobike', lat: null, lon: null },
+  ] };
+  const back = decodeShare(encodeShare(state));
+  eq(back.kind, 'bar'); eq(back.when, '2026-09-25T19:00');
+  eq(back.people[0], { name: 'Alice', q: 'Place de la République, Paris', mode: 'auto', lat: 48.87512, lon: 2.33, maxMin: null, slack: 0, after: null, backTime: '', wheelchair: false });
+  eq(back.people[1], { name: '', q: 'Place de la Bastille', mode: 'nobike', lat: null, lon: null, maxMin: null, slack: 0, after: null, backTime: '', wheelchair: false });
+  const opt = decodeShare(encodeShare({ kind: 'bar', when: 'x', people: [
+    { q: 'a', mode: 'auto', maxMin: 15, slack: 10, after: { q: 'Gare de Lyon', lat: 48.84, lon: 2.37 }, backTime: '23:30', wheelchair: true }, { q: 'b', mode: 'walk' },
+  ] })).people[0];
+  eq([opt.maxMin, opt.slack, opt.after, opt.backTime, opt.wheelchair], [15, 10, { q: 'Gare de Lyon', lat: 48.84, lon: 2.37 }, '23:30', true], 'options');
+  eq(decodeShare('#s=' + encodeURIComponent('{"p":[{"q":"a"},{"q":"b","m":"inconnu"}]}')).people.map(p => p.mode), [DEFAULT_MODE, DEFAULT_MODE], 'mode absent ou inconnu');
+  eq(decodeShare('#s=pas-du-json'), null);
+  eq(decodeShare(''), null);
+  eq(back.sel, null, 'sans lieu choisi');
+  const sel = { id: 'node/123', name: 'Le Zinc', lat: 48.861234567, lon: 2.37, tags: { amenity: 'bar' } };
+  eq(decodeShare(encodeShare({ ...state, sel })).sel, { id: 'node/123', name: 'Le Zinc', lat: 48.86123, lon: 2.37 }, 'lieu choisi');
+  const bad = id => decodeShare(encodeShare({ ...state, sel: { ...sel, id } })).sel;
+  eq([bad('javascript:alert(1)'), bad('node/12/../x'), bad(undefined)], [null, null, null], 'identifiant OSM seulement');
+  eq(decodeShare(encodeShare({ ...state, sel: { ...sel, lat: null } })).sel, null, 'sans coordonnées');
+});
+
+test('findPlace : lieu du lien par identifiant, sinon même nom tout près', () => {
+  const places = [{ id: 'way/1', name: 'Le Zinc ', ...north(100) }, { id: 'node/2', name: 'Chez Paul', ...north(50) }];
+  eq(findPlace(places, { id: 'node/2', name: 'Autre nom', ...north(900) }).id, 'node/2', 'identifiant');
+  eq(findPlace(places, { id: 'node/9', name: 'le zinc', ...north(0) }).id, 'way/1', 'point devenu contour');
+  eq(findPlace(places, { id: 'node/9', name: 'Le Zinc', ...north(600) }), undefined, 'homonyme trop loin');
+});
+
+test('lieu du lien : seulement pour la recherche du lien', () => {
+  const people = [{ q: 'Place de la République', mode: 'auto' }, { q: 'Vincennes', mode: 'transit' }];
+  const link = { id: 'node/1', name: 'Le Zinc', lat: 48.86, lon: 2.37, key: groupKey('bar', people) };
+  ok(linkApplies(link, 'bar', [{ ...people[0], q: ' Place de la République ' }, people[1]]), 'même recherche (espaces ignorés)');
+  ok(!linkApplies(link, 'resto', people), 'autre type de lieu');
+  ok(!linkApplies(link, 'bar', [people[0], { ...people[1], mode: 'walk' }]), 'mode changé');
+  ok(!linkApplies(link, 'bar', [...people, { q: 'Nation', mode: 'auto' }]), 'une personne de plus');
+  ok(!linkApplies(null, 'bar', people), 'pas de lien');
+});
+
+test('recherches récentes : 5 au plus, même groupe remonté en tête', () => {
+  const e = (kind, ...qs) => ({ kind, people: qs.map(q => ({ name: '', q, mode: 'auto' })) });
+  let list = [];
+  for (const q of ['a', 'b', 'c', 'd', 'e', 'f']) list = pushRecent(list, e('bar', q, 'z'));
+  eq(list.map(x => x.people[0].q), ['f', 'e', 'd', 'c', 'b'], 'les 5 dernières');
+  list = pushRecent(list, e('bar', 'c', 'z'));
+  eq(list.map(x => x.people[0].q), ['c', 'f', 'e', 'd', 'b'], 'même groupe : remonté, pas doublé');
+  eq(pushRecent(list, e('resto', 'c', 'z')).length, 5, 'autre type de lieu : autre entrée');
+  eq(pushRecent('pas une liste', e('bar', 'a', 'b')).length, 1, 'mémoire illisible');
+  const named = { kind: 'bar', people: [{ name: 'Alice', q: 'Place de la République, Paris' }, { name: '', q: 'Place de la Bastille, Paris' }] };
+  eq(recentLabel(named), '🍺 Alice, Place de la Bastille');
+  eq(recentLabel({ kind: '?', people: [{ q: 'x' }, {}] }), '🍽️ x, ?', 'type inconnu, adresse absente');
+});
+
+test('récap du rendez-vous : départ, mode, lignes, retour', () => {
+  const arrive = new Date(2026, 8, 25, 19, 0);
+  const people = [{ i: 0, name: 'Alice' }, { i: 1, name: '' }, { i: 2, name: 'Zoé' }];
+  const itin = { startTime: new Date(2026, 8, 25, 18, 38).toISOString(), legs: [{ mode: 'WALK' }, { mode: 'SUBWAY', routeShortName: '14' }, { mode: 'RAIL', routeShortName: 'A' }] };
+  const legs = [
+    { via: 'transit', sec: 1400, exact: 1260, itin, back: { via: 'walk', sec: 600 } },
+    { via: 'velib', sec: 900, opts: { velib: { start: { name: 'Bastille' } } }, back: { via: 'transit', none: true } },
+    { via: undefined, sec: null },
+  ];
+  const place = { name: 'Chez Paul', lat: 48.85, lon: 2.37, tags: { 'addr:housenumber': '13', 'addr:street': 'rue de Charonne', 'addr:postcode': '75011' } };
+  const lines = recapPlace({ kind: 'resto', arrive, place, people, legs }).split('\n');
+  ok(lines[0].startsWith('🍽️ Rendez-vous ') && lines[0].endsWith('à 19:00 : Chez Paul, 13 rue de Charonne 75011'), lines[0]);
+  ok(lines[1].startsWith('https://www.google.com/maps/search/?api=1&query=Chez%20Paul'), 'lien');
+  eq(lines[2], '• Alice : départ 18:38 · 🚇 21 min (métro 14, RER A) · retour 🚶 10 min');
+  eq(lineLabel({ mode: 'BUS', routeShortName: '91' }) + ' / ' + lineLabel({ mode: 'REGIONAL_RAIL', routeShortName: 'P' }), 'bus 91 / train P');
+  eq(lines[3], "• B : départ 18:45 · Vélib' 15 min (station Bastille) · ⚠️ plus de transports pour rentrer");
+  eq(lines[4], '• Zoé : pas de trajet trouvé');
+  const wc = recapPlace({ kind: 'resto', arrive, place, people: [{ i: 0, name: 'Zoé', wheelchair: true }], legs: [{ via: 'walk', sec: 600, back: { via: 'walk', sec: 600 } }] }).split('\n');
+  eq(wc[2], '• Zoé : départ 18:50 · ♿ 10 min en fauteuil · retour ♿ 10 min', 'en fauteuil');
+  eq(lines.length, 5, 'sans lien : rien de plus');
+  const withLink = recapPlace({ kind: 'resto', arrive, place, people, legs, link: 'https://ex.org/#s=x' }).split('\n');
+  eq(withLink.slice(-1)[0], 'Le trajet détaillé de chacun : https://ex.org/#s=x');
+});
+
+test('affinage : allers des fiches dans l\'ordre, puis retours de la 1re seulement', () => {
+  const people = [{ i: 0 }, { i: 1 }];
+  const t = (extra = {}) => ({ via: 'transit', sec: 900, ...extra });
+  const legs = [null,
+    [t({ back: t() }), { via: 'walk', sec: 600, back: t() }],              // fiche 1 : Alice transports, Bob à pied (retour en transports)
+    [t({ exact: 800, back: t() }), t({ back: t({ none: true }) })],        // fiche 2 : aller de Alice déjà exact
+    [t(), t({ back: { via: 'walk', sec: 300 } })]];
+  const top = [{ di: 1 }, { di: 2 }, { di: 3 }];
+  eq(refineOrder(top, people, legs).map(j => `${j.di}.${j.pi}${j.back ? 'r' : ''}`), ['1.0', '2.1', '3.0', '3.1', '1.0r', '1.1r']);
+  eq(refineOrder([{ di: 2 }], people, legs).map(j => `${j.di}.${j.pi}${j.back ? 'r' : ''}`), ['2.1', '2.0r'], 'retour sans transports écarté');
+});
+
+test('liens : parenthèses encodées, temps restant de l\'affinage', () => {
+  const url = placeSearchUrl({ name: "Le Central (Bastille)", lat: 48.85, lon: 2.37, tags: { 'addr:street': "rue de l'Arsenal" } });
+  ok(!/[()']/.test(url) && url.includes('%28Bastille%29') && url.includes('l%27Arsenal'), url);
+  const back = decodeShare(encodeShare({ kind: 'bar', when: 'x', people: [{ q: 'Gare (sortie 2)', mode: 'auto' }, { q: "l'Arsenal", mode: 'walk' }] }));
+  eq(back.people.map(p => p.q), ['Gare (sortie 2)', "l'Arsenal"], 'lien de partage');
+  eq([remainingText(1, 40, 3000), remainingText(40, 40, 9e4)], ['', ''], 'trop tôt, ou fini');
+  eq(remainingText(4, 40, 8000), 'environ 1 min');
+  eq(remainingText(5, 10, 20000), 'environ 20 s');
+  eq(remainingText(9, 10, 9000), 'quelques secondes');
+});
+
+test('récap des choix : numérotés, avec le plus long trajet', () => {
+  const people = [{ i: 0, name: 'Alice' }, { i: 1, name: 'Bob' }];
+  const c = (name, cuisine) => ({ name, lat: 48.85, lon: 2.37, tags: cuisine ? { cuisine } : {} });
+  const legs = [null, [{ sec: 600 }, { sec: 900, back: { sec: 300 } }], [{ sec: 800, exact: 700 }, { sec: null }]];
+  const lines = recapChoices({ kind: 'bar', arrive: new Date(2026, 8, 25, 19, 0), top: [{ di: 1, c: c('Le Zinc', 'wine;beer;tapas') }, { di: 2, c: c('Chez Nous') }], people, legs }).split('\n');
+  ok(lines[0].startsWith('🍺 On se retrouve où, ') && lines[0].endsWith('à 19:00 ? Répondez avec un numéro :'), lines[0]);
+  eq(lines[1], '1. Le Zinc (vin, bière) : au plus 20 min de trajet (Bob, aller + retour)');
+  ok(lines[2].startsWith('   https://www.google.com/maps/'), 'lien indenté');
+  eq(lines[3], '2. Chez Nous : trajet incomplet');
+  const linked = recapChoices({ kind: 'bar', arrive: new Date(2026, 8, 25, 19, 0), top: [], people, legs, link: 'https://ex.org/#s=y' }).split('\n');
+  eq(linked.slice(1), ['Sur la carte, avec le trajet de chacun : https://ex.org/#s=y'], 'lien en dernière ligne');
+});
+
+test('agenda .ics : dates UTC, échappement, lignes repliées', () => {
+  const place = { id: 'node/42', name: 'Chez Paul; le vrai, le seul', lat: 48.85, lon: 2.37, tags: { 'addr:street': 'rue de Charonne', 'addr:postcode': '75011' } };
+  const ics = icsEvent({ kind: 'bar', arrive: new Date(Date.UTC(2026, 8, 25, 18, 30)), place, description: '🍺 Rendez-vous\n• Alice : départ 18:10 · 🚇 20 min (métro 14, RER A, bus 91, tram T3a) · retour 🚶 10 min', now: new Date(Date.UTC(2026, 8, 25, 12)) });
+  const lines = ics.split('\r\n');
+  ok(ics.endsWith('END:VCALENDAR\r\n'), 'fin');
+  ok(lines.includes('DTSTART:20260925T183000Z') && lines.includes('DTEND:20260925T203000Z') && lines.includes('DTSTAMP:20260925T120000Z'), 'dates');
+  ok(lines.includes('UID:20260925T183000Z-node-42@on-se-retrouve-ou'), 'uid');
+  ok(lines.every(l => new TextEncoder().encode(l).length <= 75), 'lignes ≤ 75 octets');
+  const unfolded = ics.replace(/\r\n /g, '');
+  ok(unfolded.includes('SUMMARY:🍺 Chez Paul\\; le vrai\\, le seul\r\n'), 'titre échappé');
+  ok(unfolded.includes('DESCRIPTION:🍺 Rendez-vous\\n• Alice'), 'retours à la ligne échappés');
+  ok(unfolded.includes('LOCATION:Chez Paul\\; le vrai\\, le seul\\, rue de Charonne 75011'), 'lieu');
+});
+
+// ---------- hours.js ----------
+const at = (y, mo, d, h, mi) => new Date(y, mo - 1, d, h, mi);
+test('opening_hours chargée', () => ok(hoursLibReady(), 'bibliothèque absente'));
+test('horaires : midi et soir, dimanche fermé', () => {
+  const v = 'Mo-Sa 12:00-14:30,19:00-22:30; Su off';
+  const r = hoursAt(v, at(2026, 9, 24, 12, 30));
+  eq(r.status, 'open'); eq(hhmm(r.closes), '14:30');
+  const late = hoursAt(v, at(2026, 9, 24, 14, 0));
+  eq([late.status, late.early], ['closed', true], 'ferme 30 min après');
+  eq(hoursAt(v, at(2026, 9, 27, 12, 30)).status, 'closed', 'dimanche');
+});
+test('horaires : jours fériés (PH off)', () => {
+  const v = 'Mo-Sa 12:00-14:30; PH off';
+  eq(hoursAt(v, at(2026, 12, 24, 12, 30)).status, 'open', '24 décembre');
+  eq(hoursAt(v, at(2026, 12, 25, 12, 30)).status, 'closed', 'Noël');
+});
+test('horaires : après minuit, 24/7, illisible, absent', () => {
+  const night = hoursAt('Mo-Su 18:00-02:00', at(2026, 9, 24, 23, 30));
+  eq(night.status, 'open'); eq(hhmm(night.closes), '02:00');
+  eq(hoursAt('24/7', at(2026, 9, 24, 3, 0)).status, 'open');
+  eq(hoursAt('parfois le midi', at(2026, 9, 24, 12, 30)).status, 'unknown');
+  eq(hoursAt(undefined, at(2026, 9, 24, 12, 30)).status, 'unknown');
+});
+
+// ---------- weather.js ----------
+test('météo : icônes WMO', () => {
+  eq([0, 2, 3, 45, 53, 63, 73, 81, 86, 95].map(c => weatherIcon(c)), ['☀️', '⛅', '☁️', '🌫️', '🌦️', '🌧️', '🌨️', '🌦️', '🌨️', '⛈️']);
+  eq(weatherIcon(0, false), '🌙', 'nuit claire');
+});
+
+test('météo : pendant la sortie, la pluie l\'emporte', () => {
+  const t0 = new Date(Date.UTC(2026, 8, 25, 17, 0)).getTime() / 1000;
+  const h = (codes, probs, mm) => ({
+    time: codes.map((_, k) => t0 + k * 3600), weather_code: codes, precipitation_probability: probs,
+    precipitation: mm, temperature_2m: codes.map((_, k) => 20 - k), is_day: codes.map(() => 1),
+  });
+  const arrive = new Date(Date.UTC(2026, 8, 25, 17, 30));
+  const dry = weatherAt(h([0, 1, 2, 61], [0, 5, 10, 90], [0, 0, 0, 3]), arrive, 120);
+  eq([dry.level, dry.icon, dry.temp, dry.prob], ['dry', '☀️', 20, 10], 'averse après le départ : ignorée');
+  const wet = weatherAt(h([0, 63, 2], [10, 80, 20], [0, 2.5, 0]), arrive, 90);
+  eq([wet.level, wet.icon, wet.prob], ['wet', '🌧️', 80]);
+  eq(weatherText(wet), '🌧️ 20 °C, pluie probable (80 %)');
+  eq(weatherAt(h([0, 80], [40, 35], [0.1, 0]), arrive, 60).level, 'maybe');
+  eq(weatherAt(h([0], [0], [0]), new Date(Date.UTC(2026, 8, 26, 12)), 60), null, 'hors prévisions');
+  eq(weatherAt(null, arrive, 60), null);
+});
+
+test('récap : ligne météo', () => {
+  const w = { icon: '☀️', temp: 24.6, prob: 0, level: 'dry' };
+  const txt = recapChoices({ kind: 'cafe', arrive: new Date(2026, 8, 25, 16, 0), top: [], people: [], legs: [], weather: w });
+  eq(txt.split('\n')[1], 'Météo prévue : ☀️ 25 °C, sec');
+});
+
+// ---------- résultat ----------
+const nOk = results.filter(r => r.ok).length;
+$('summary').innerHTML = `<span class="${nOk === results.length ? 'ok' : 'ko'}">${nOk}/${results.length} tests OK</span>`;
+$('list').innerHTML = results.map(r => `<div class="${r.ok ? 'ok' : 'ko'}">${r.ok ? '✓' : '✗'} ${esc(r.name)}</div>${r.ok ? '' : `<div class="err">${esc(r.err)}</div>`}`).join('');
+</script>
+</body>
+</html>
